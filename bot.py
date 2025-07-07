@@ -119,30 +119,45 @@ class VetDictionaryBot:
             os.remove(self.lock_file)
 
     def _init_firebase(self):
-        """Initialize Firebase Firestore client from environment credentials.
+        """Initialize Firebase Firestore client from serviceAccount.json file.
         Returns the Firestore client instance or None if credentials are missing/invalid.
         """
-        # 1️⃣ Prefer full service-account JSON via GOOGLE_APPLICATION_CREDENTIALS
-        sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        # Allow using a relative path inside the .env file. We convert it to an
-        # absolute path relative to this source file so that `os.path.isfile` works
-        # no matter where the bot is launched from.
-        if sa_path and not os.path.isabs(sa_path):
-            sa_path = os.path.join(os.path.dirname(__file__), sa_path)
-        if sa_path and os.path.isfile(sa_path):
+        # Use the serviceAccount.json file directly
+        sa_path = os.path.join(os.path.dirname(__file__), 'serviceAccount.json')
+        
+        if os.path.isfile(sa_path):
             try:
+                # Read and validate the service account file
+                with open(sa_path, 'r') as f:
+                    sa_data = json.load(f)
+                
+                # Validate required fields
+                required_fields = ['type', 'project_id', 'private_key', 'client_email']
+                if not all(field in sa_data for field in required_fields):
+                    logger.error("Service account file is missing required fields")
+                    return None
+                
+                # Clean up the private key
+                private_key = sa_data['private_key']
+                if not private_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                    logger.error("Invalid private key format")
+                    return None
+                
                 cred = credentials.Certificate(sa_path)
                 try:
                     initialize_app(cred)
                 except ValueError:
                     pass  # already initialised
-                logger.info("Firebase initialised from service-account file.")
+                logger.info("Firebase initialised from serviceAccount.json file.")
                 return firestore.client()
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in service account file: {e}")
+                return None
             except Exception as e:
-                logger.error(f"Failed to init Firebase using GOOGLE_APPLICATION_CREDENTIALS: {e}")
-                # fall through to env pieces if provided
-
-        # 2️⃣ Fallback to individual env pieces
+                logger.error(f"Failed to init Firebase using serviceAccount.json: {e}")
+                return None
+        
+        # Fallback to environment variables
         project_id = os.getenv("FIREBASE_PROJECT_ID")
         private_key = os.getenv("FIREBASE_PRIVATE_KEY")
         client_email = os.getenv("FIREBASE_CLIENT_EMAIL")
@@ -153,10 +168,16 @@ class VetDictionaryBot:
             return None
 
         try:
+            # Clean and validate private key
+            cleaned_key = private_key.replace('\\n', '\n').strip('"').strip("'")
+            if not cleaned_key.startswith('-----BEGIN PRIVATE KEY-----'):
+                logger.error("Invalid private key format in environment variables")
+                return None
+            
             cred = credentials.Certificate({
                 "type": "service_account",
                 "project_id": project_id,
-                "private_key": private_key.replace('\\n', '\n').strip('"').strip("'") ,
+                "private_key": cleaned_key,
                 "client_email": client_email,
                 "token_uri": "https://oauth2.googleapis.com/token"
             })
@@ -231,6 +252,7 @@ class VetDictionaryBot:
         keyboard = [
             [InlineKeyboardButton("➕ Add Content", callback_data="menu_add")],
             [InlineKeyboardButton("👁️ View Content", callback_data="menu_view")],
+            [InlineKeyboardButton("🔍 Search Content", callback_data="menu_search")],
             [InlineKeyboardButton("✏️ Edit Content", callback_data="menu_edit")],
             [InlineKeyboardButton("🗑️ Delete Content", callback_data="menu_delete")],
             [InlineKeyboardButton("📊 Statistics", callback_data="menu_stats")],
@@ -293,12 +315,17 @@ class VetDictionaryBot:
                     "Select a collection to delete:",
                     reply_markup=self.get_collection_menu_keyboard("delete")
                 )
+            elif data == "menu_search":
+                await query.edit_message_text(
+                    "Select a collection to search:",
+                    reply_markup=self.get_collection_menu_keyboard("search")
+                )
             elif data == "menu_stats":
                 await self.show_statistics_callback(query)
             elif data == "menu_collections":
                 await self.show_collections_info_callback(query)
             # === Collection-specific actions (e.g. add_books) ===
-            elif data.startswith(("add_", "view_", "edit_", "delete_")):
+            elif data.startswith(("add_", "view_", "edit_", "delete_", "search_")):
                 await self.handle_collection_action(query, data)
             else:
                 logger.warning(f"Unknown button action received: {data}")
@@ -381,6 +408,17 @@ class VetDictionaryBot:
                 await query.edit_message_text(
                     f"Please send me the ID of the {collection_info['name'].lower()} you want to delete:"
                 )
+                
+            elif action == "search":
+                session['action'] = 'search'
+                session['collection'] = collection
+                session['waiting_for'] = 'search_query'
+                
+                collection_info = self.collections[collection]
+                await query.edit_message_text(
+                    f"🔍 Search in {collection_info['name']}\n\n"
+                    f"Please send me the search term:"
+                )
         except Exception as e:
             logger.error(f"Error in collection action: {e}")
             await query.message.reply_text(
@@ -407,6 +445,8 @@ class VetDictionaryBot:
                 await self.handle_edit_input(update, text, session)
             elif session['action'] == 'delete':
                 await self.handle_delete_input(update, text, session)
+            elif session['action'] == 'search':
+                await self.handle_search_input(update, text, session)
         except Exception as e:
             logger.error(f"Error handling text message: {e}")
             await update.message.reply_text(
@@ -449,28 +489,40 @@ class VetDictionaryBot:
             return
             
         try:
-            # Get all document IDs and find max numeric ID
-            docs = self.db.collection(collection).stream()
-            max_id = 0
-            for doc in docs:
-                try:
-                    doc_id = int(doc.get('id')) if doc.get('id') else 0
-                    max_id = max(max_id, doc_id)
-                except (ValueError, TypeError):
-                    continue  # Skip non-numeric IDs
+            # Validate required fields based on collection type
+            validation_error = self.validate_item_data(collection, data)
+            if validation_error:
+                await update.message.reply_text(
+                    f"❌ Validation error: {validation_error}",
+                    reply_markup=self.get_main_menu_keyboard()
+                )
+                return
             
-            new_id = max_id + 1
-            data['id'] = new_id
+            # Generate timestamp-based numeric ID for the id field (matching your existing structure)
+            import time
+            numeric_id = int(time.time() * 1000)  # Current timestamp in milliseconds
+            data['id'] = numeric_id
             data['createdAt'] = datetime.now().isoformat()
             
-            await self.db.collection(collection).document(str(new_id)).set(data)
-            logger.info(f"Saved new {collection} item to Firebase with id {new_id}")
+            # Add collection-specific fields if needed
+            if collection == 'drugs':
+                data['class'] = data.get('class', 'General')  # Default class for drugs
+            elif collection == 'normalRanges':
+                # Ensure numeric values for ranges
+                data['minValue'] = float(data.get('minValue', 0))
+                data['maxValue'] = float(data.get('maxValue', 0))
+            
+            # Let Firebase auto-generate the document ID (matching your existing pattern)
+            doc_ref = self.db.collection(collection).add(data)
+            generated_doc_id = doc_ref[1].id  # Get the auto-generated document ID
+            logger.info(f"Saved new {collection} item to Firebase with document ID {generated_doc_id} and numeric ID {numeric_id}")
             
             data_display = "\n".join([f"• {key}: {value}" for key, value in data.items() if key not in ['id', 'createdAt']])
             
             await update.message.reply_text(
                 f"✅ {collection_info['name']} added to Firebase!\n\n"
-                f"ID: {new_id}\n"
+                f"Document ID: {generated_doc_id}\n"
+                f"Numeric ID: {numeric_id}\n"
                 f"{data_display}",
                 reply_markup=self.get_main_menu_keyboard()
             )
@@ -484,17 +536,57 @@ class VetDictionaryBot:
                 reply_markup=self.get_main_menu_keyboard()
             )
 
+    def validate_item_data(self, collection: str, data: dict) -> str:
+        """Validate item data based on collection requirements"""
+        required_fields = {
+            'words': ['name', 'kurdish', 'arabic'],
+            'drugs': ['name', 'usage'],
+            'books': ['title', 'description'],
+            'diseases': ['name', 'symptoms'],
+            'staff': ['name', 'job'],
+            'tutorialVideos': ['Title', 'VideoID'],
+            'notifications': ['title', 'body'],
+            'users': ['username'],
+            'normalRanges': ['name', 'unit', 'minValue', 'maxValue'],
+            'appLinks': ['url']
+        }
+        
+        if collection in required_fields:
+            for field in required_fields[collection]:
+                if not data.get(field, '').strip():
+                    return f"Field '{field}' is required and cannot be empty"
+        
+        # Special validations
+        if collection == 'normalRanges':
+            try:
+                min_val = float(data.get('minValue', 0))
+                max_val = float(data.get('maxValue', 0))
+                if min_val >= max_val:
+                    return "minValue must be less than maxValue"
+            except ValueError:
+                return "minValue and maxValue must be valid numbers"
+        
+        return None  # No validation errors
+
     async def handle_edit_input(self, update: Update, text: str, session: Dict[str, Any]):
         if session.get('waiting_for') == 'id':
             try:
                 item_id = int(text)
                 collection = session['collection']
                 
-                doc_ref = self.db.collection(collection).document(str(item_id))
-                doc = doc_ref.get()
+                # Search for document by the numeric ID field (not document ID)
+                docs = self.db.collection(collection).where('id', '==', item_id).stream()
+                doc_found = None
+                doc_id = None
                 
-                if doc.exists:
+                for doc in docs:
+                    doc_found = doc
+                    doc_id = doc.id
+                    break
+                
+                if doc_found:
                     session['item_id'] = item_id
+                    session['doc_id'] = doc_id  # Store the Firebase document ID
                     session['waiting_for'] = 'field_data'
                     session['current_field'] = 0
                     session['data'] = {}
@@ -502,7 +594,7 @@ class VetDictionaryBot:
                     collection_info = self.collections[collection]
                     field = collection_info['fields'][0]
                     
-                    current_data = "\n".join([f"• {key}: {value}" for key, value in doc.to_dict().items() if key not in ['id', 'createdAt']])
+                    current_data = "\n".join([f"• {key}: {value}" for key, value in doc_found.to_dict().items() if key not in ['id', 'createdAt']])
                     
                     await update.message.reply_text(
                         f"Editing {collection_info['name']} (ID: {item_id})\n\n"
@@ -527,11 +619,16 @@ class VetDictionaryBot:
                 collection = session['collection']
                 collection_info = self.collections[collection]
                 
-                doc_ref = self.db.collection(collection).document(str(item_id))
-                doc = doc_ref.get()
+                # Search for document by the numeric ID field (not document ID)
+                docs = self.db.collection(collection).where('id', '==', item_id).stream()
+                doc_found = None
                 
-                if doc.exists:
-                    doc_ref.delete()
+                for doc in docs:
+                    doc_found = doc
+                    break
+                
+                if doc_found:
+                    doc_found.reference.delete()
                     await update.message.reply_text(
                         f"✅ {collection_info['name']} with ID {item_id} deleted successfully!",
                         reply_markup=self.get_main_menu_keyboard()
@@ -546,6 +643,45 @@ class VetDictionaryBot:
                 
             except ValueError:
                 await update.message.reply_text("❌ Please provide a valid numeric ID.")
+
+    async def handle_search_input(self, update: Update, text: str, session: Dict[str, Any]):
+        if session.get('waiting_for') == 'search_query':
+            try:
+                search_term = text.strip()
+                collection = session['collection']
+                collection_info = self.collections[collection]
+                
+                # Search logic based on collection type
+                results = await self.search_in_collection(collection, search_term)
+                
+                if results:
+                    search_text = f"🔍 Search results for '{search_term}' in {collection_info['name']}:\n\n"
+                    
+                    for item in results[:10]:  # Limit to 10 results
+                        display_name = self.get_item_display_name(item, collection)
+                        search_text += f"• {display_name} (ID: {item.get('id', 'N/A')})\n"
+                    
+                    if len(results) > 10:
+                        search_text += f"\n... and {len(results) - 10} more results"
+                    
+                    search_text += f"\n\nTotal found: {len(results)} items"
+                else:
+                    search_text = f"❌ No results found for '{search_term}' in {collection_info['name']}"
+                
+                await update.message.reply_text(
+                    search_text,
+                    reply_markup=self.get_main_menu_keyboard()
+                )
+                
+                self.clear_session(update.effective_user.id)
+                
+            except Exception as e:
+                logger.error(f"Error in search: {e}")
+                await update.message.reply_text(
+                    f"❌ Search error: {str(e)}",
+                    reply_markup=self.get_main_menu_keyboard()
+                )
+                self.clear_session(update.effective_user.id)
 
     async def show_collection_data(self, query, collection: str):
         collection_info = self.collections[collection]
@@ -624,6 +760,66 @@ class VetDictionaryBot:
         except Exception as e:
             logger.error(f"Error getting collection count: {e}")
             return 0
+
+    async def search_in_collection(self, collection: str, search_term: str) -> list:
+        """Search for items in a collection based on the search term"""
+        if not self.db:
+            return []
+        
+        try:
+            # Get all documents from the collection
+            docs = self.db.collection(collection).stream()
+            results = []
+            
+            search_lower = search_term.lower()
+            
+            for doc in docs:
+                data = doc.to_dict()
+                # Search in all text fields
+                found = False
+                
+                for field_name in self.collections[collection]['fields']:
+                    field_value = data.get(field_name, '')
+                    if isinstance(field_value, str) and search_lower in field_value.lower():
+                        found = True
+                        break
+                
+                if found:
+                    results.append(data)
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error searching collection {collection}: {e}")
+            return []
+
+    def get_item_display_name(self, item: dict, collection: str) -> str:
+        """Get a display name for an item based on its collection type"""
+        if collection == 'words':
+            return item.get('name', 'Unnamed word')
+        elif collection == 'drugs':
+            return item.get('name', 'Unnamed drug')
+        elif collection == 'books':
+            return item.get('title', 'Untitled book')
+        elif collection == 'diseases':
+            return item.get('name', 'Unnamed disease')
+        elif collection == 'staff':
+            return item.get('name', 'Unnamed staff')
+        elif collection == 'tutorialVideos':
+            return item.get('Title', 'Untitled video')
+        elif collection == 'questions':
+            text = item.get('text', 'No text')
+            return text[:50] + "..." if len(text) > 50 else text
+        elif collection == 'notifications':
+            return item.get('title', 'Untitled notification')
+        elif collection == 'users':
+            return item.get('username', 'Unnamed user')
+        elif collection == 'normalRanges':
+            return item.get('name', 'Unnamed range')
+        elif collection == 'appLinks':
+            return item.get('url', 'No URL')
+        else:
+            return f"Item {item.get('id', 'N/A')}"
 
     def run(self):
         application = Application.builder().token(self.bot_token).build()
